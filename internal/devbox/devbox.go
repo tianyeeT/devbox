@@ -59,6 +59,7 @@ const (
 type Devbox struct {
 	cfg                      *devconfig.Config
 	env                      map[string]string
+	envForPackageBins        bool
 	environment              string
 	lockfile                 *lock.File
 	nix                      nix.Nixer
@@ -97,6 +98,7 @@ func Open(opts *devopt.Opts) (*Devbox, error) {
 	box := &Devbox{
 		cfg:                      cfg,
 		env:                      opts.Env,
+		envForPackageBins:        opts.EnvForPackageBins,
 		environment:              environment,
 		nix:                      &nix.Nix{},
 		projectDir:               projectDir,
@@ -791,6 +793,61 @@ func (d *Devbox) StartProcessManager(
 	)
 }
 
+func (d *Devbox) execPrintDevEnv(ctx context.Context, usePrintDevEnvCache bool) (map[string]string, error) {
+	var spinny *spinner.Spinner
+	if !usePrintDevEnvCache {
+		spinny = spinner.New(spinner.CharSets[11], 100*time.Millisecond, spinner.WithWriter(d.stderr))
+		spinny.FinalMSG = "✓ Computed the Devbox environment.\n"
+		spinny.Suffix = " Computing the Devbox environment...\n"
+		spinny.Start()
+	}
+
+	vaf, err := d.nix.PrintDevEnv(ctx, &nix.PrintDevEnvArgs{
+		FlakeDir:             d.flakeDir(),
+		PrintDevEnvCachePath: d.nixPrintDevEnvCachePath(),
+		UsePrintDevEnvCache:  usePrintDevEnvCache,
+	})
+	if spinny != nil {
+		spinny.Stop()
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Add environment variables from "nix print-dev-env" except for a few
+	// special ones we need to ignore.
+	env := map[string]string{}
+	for key, val := range vaf.Variables {
+		// We only care about "exported" because the var and array types seem to only be used by nix-defined
+		// functions that we don't need (like genericBuild). For reference, each type translates to bash as follows:
+		// var: export VAR=VAL
+		// exported: export VAR=VAL
+		// array: declare -a VAR=('VAL1' 'VAL2' )
+		if val.Type != "exported" {
+			continue
+		}
+
+		// SSL_CERT_FILE is a special-case. We only ignore it if it's
+		// set to a specific value. This emulates the behavior of
+		// "nix develop".
+		if key == "SSL_CERT_FILE" && val.Value.(string) == "/no-cert-file.crt" {
+			continue
+		}
+
+		// Certain variables get set to invalid values after Nix builds
+		// the shell environment. For example, HOME=/homeless-shelter
+		// and TMPDIR points to a missing directory. We want to ignore
+		// those values and just use the values from the current
+		// environment instead.
+		if ignoreDevEnvVar[key] {
+			continue
+		}
+
+		env[key] = val.Value.(string)
+	}
+	return env, nil
+}
+
 // computeEnv computes the set of environment variables that define a Devbox
 // environment. The "devbox run" and "devbox shell" commands source these
 // variables into a shell before executing a command or showing an interactive
@@ -841,58 +898,17 @@ func (d *Devbox) computeEnv(ctx context.Context, usePrintDevEnvCache bool) (map[
 	originalEnv := make(map[string]string, len(env))
 	maps.Copy(originalEnv, env)
 
-	var spinny *spinner.Spinner
-	if !usePrintDevEnvCache {
-		spinny = spinner.New(spinner.CharSets[11], 100*time.Millisecond, spinner.WithWriter(d.stderr))
-		spinny.FinalMSG = "✓ Computed the Devbox environment.\n"
-		spinny.Suffix = " Computing the Devbox environment...\n"
-		spinny.Start()
-	}
-
-	vaf, err := d.nix.PrintDevEnv(ctx, &nix.PrintDevEnvArgs{
-		FlakeDir:             d.flakeDir(),
-		PrintDevEnvCachePath: d.nixPrintDevEnvCachePath(),
-		UsePrintDevEnvCache:  usePrintDevEnvCache,
-	})
-	if spinny != nil {
-		spinny.Stop()
-	}
+	nixEnv, err := d.execPrintDevEnv(ctx, usePrintDevEnvCache)
 	if err != nil {
 		return nil, err
 	}
-
-	// Add environment variables from "nix print-dev-env" except for a few
-	// special ones we need to ignore.
-	for key, val := range vaf.Variables {
-		// We only care about "exported" because the var and array types seem to only be used by nix-defined
-		// functions that we don't need (like genericBuild). For reference, each type translates to bash as follows:
-		// var: export VAR=VAL
-		// exported: export VAR=VAL
-		// array: declare -a VAR=('VAL1' 'VAL2' )
-		if val.Type != "exported" {
-			continue
+	env["PATH"] = nixEnv["PATH"]
+	if !d.envForPackageBins {
+		for k, v := range nixEnv {
+			env[k] = v
 		}
-
-		// SSL_CERT_FILE is a special-case. We only ignore it if it's
-		// set to a specific value. This emulates the behavior of
-		// "nix develop".
-		if key == "SSL_CERT_FILE" && val.Value.(string) == "/no-cert-file.crt" {
-			continue
-		}
-
-		// Certain variables get set to invalid values after Nix builds
-		// the shell environment. For example, HOME=/homeless-shelter
-		// and TMPDIR points to a missing directory. We want to ignore
-		// those values and just use the values from the current
-		// environment instead.
-		if ignoreDevEnvVar[key] {
-			continue
-		}
-
-		env[key] = val.Value.(string)
 	}
-
-	slog.Debug("nix environment PATH", "path", env)
+	slog.Debug("nix environment PATH", "path", env["PATH"])
 
 	env["PATH"] = envpath.JoinPathLists(
 		nix.ProfileBinPath(d.projectDir),
@@ -976,12 +992,14 @@ func (d *Devbox) computeEnv(ctx context.Context, usePrintDevEnvCache bool) (map[
 		env[k] = v
 	}
 
-	return env, d.addHashToEnv(env)
+	if err := d.addHashToEnv(env); err != nil {
+		return nil, err
+	}
+	return env, nil
 }
 
-// ensureStateIsUpToDateAndComputeEnv will return a map of the env-vars for the Devbox  Environment
+// ensureStateIsUpToDateAndComputeEnv will return a map of the env-vars for the Devbox Environment
 // while ensuring these reflect the current (up to date) state of the project.
-// TODO: find a better name for this function.
 func (d *Devbox) ensureStateIsUpToDateAndComputeEnv(
 	ctx context.Context,
 ) (map[string]string, error) {
